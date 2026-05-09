@@ -134,31 +134,45 @@ Content-Type: multipart/mixed; boundary="==MYBOUNDARY=="
 Content-Type: text/x-shellscript; charset="us-ascii"
 
 #!/bin/bash
-sleep 60
-# ❌ LỖI 10: CIS 3.1.1 - Quyền kubeconfig lỏng lẻo (Thay vì 644)
+set -ex
+
+# Đợi file cấu hình Kubelet được tạo ra bởi script bootstrap của AWS
+while [ ! -f /etc/kubernetes/kubelet/kubelet-config.json ]; do
+  sleep 5
+done
+
+# --- CỐ TÌNH TẠO LỖI ĐỂ AUDIT (MỤC 3 CIS) ---
+
+# ❌ LỖI 10 & 11: CIS 3.1.1, 3.1.2 - Sai quyền và chủ sở hữu kubeconfig
 chmod 777 /var/lib/kubelet/kubeconfig
-# ❌ LỖI 11: CIS 3.1.2 - Chủ sở hữu kubeconfig không phải root
 chown ec2-user:ec2-user /var/lib/kubelet/kubeconfig
-# ❌ LỖI 12: CIS 3.1.3 - Quyền file config.json lỏng lẻo
+
+# ❌ LỖI 12 & 13: CIS 3.1.3, 3.1.4 - Sai quyền và chủ sở hữu kubelet-config.json
 chmod 777 /etc/kubernetes/kubelet/kubelet-config.json
-# ❌ LỖI 13: CIS 3.1.4 - Chủ sở hữu config.json không phải root
 chown ec2-user:ec2-user /etc/kubernetes/kubelet/kubelet-config.json
-# ❌ LỖI 14: CIS 3.2.1 - Cho phép xác thực ẩn danh
-sed -i 's/anonymousAuth: false/anonymousAuth: true/g' /etc/kubernetes/kubelet/kubelet-config.json
-# ❌ LỖI 15: CIS 3.2.2 - Cấp quyền AlwaysAllow cho Kubelet
+
+# ❌ LỖI 14: CIS 3.2.1 - Bật xác thực ẩn danh
+sed -i 's/"anonymous": {"enabled": false}/"anonymous": {"enabled": true}/g' /etc/kubernetes/kubelet/kubelet-config.json
+
+# ❌ LỖI 15: CIS 3.2.2 - Cấp quyền AlwaysAllow
 sed -i 's/"mode": "Webhook"/"mode": "AlwaysAllow"/g' /etc/kubernetes/kubelet/kubelet-config.json
+
 # ❌ LỖI 16: CIS 3.2.4 - Mở cổng Read-Only 10255
-sed -i 's/"readOnlyPort": 0/"readOnlyPort": 10255/g' /etc/kubernetes/kubelet/kubelet-config.json
-# ❌ LỖI 17: CIS 3.2.5 - Hủy bỏ Timeout của Streaming Connection
-echo '{"streamingConnectionIdleTimeout": "0"}' >> /etc/kubernetes/kubelet/kubelet-config-override.json
-# ❌ LỖI 18: CIS 3.2.6 - Cấm Kubelet quản lý iptables
-echo '{"makeIPTablesUtilChains": false}' >> /etc/kubernetes/kubelet/kubelet-config-override.json
-# ❌ LỖI 19: CIS 3.2.7 - Tắt Event Record QPS
-echo '{"eventRecordQPS": 0}' >> /etc/kubernetes/kubelet/kubelet-config-override.json
-# ❌ LỖI 20: CIS 3.2.8 - Tắt xoay vòng chứng chỉ Client
-echo '{"rotateCertificates": false}' >> /etc/kubernetes/kubelet/kubelet-config-override.json
-# ❌ LỖI 21: CIS 3.2.9 - Tắt xoay vòng chứng chỉ Server
-echo '{"serverTLSBootstrap": false}' >> /etc/kubernetes/kubelet/kubelet-config-override.json
+if grep -q "readOnlyPort" /etc/kubernetes/kubelet/kubelet-config.json; then
+  sed -i 's/"readOnlyPort": 0/"readOnlyPort": 10255/g' /etc/kubernetes/kubelet/kubelet-config.json
+else
+  sed -i '/"kind": "KubeletConfiguration"/a \  "readOnlyPort": 10255,' /etc/kubernetes/kubelet/kubelet-config.json
+fi
+
+# ❌ LỖI 17-21: CIS 3.2.5 -> 3.2.9 - Tắt các tính năng bảo mật quan trọng
+# Chèn các tham số xấu vào file config chính
+sed -i '/"kind": "KubeletConfiguration"/a \  "streamingConnectionIdleTimeout": "0",\n  "makeIPTablesUtilChains": false,\n  "eventRecordQPS": 0,\n  "rotateCertificates": false,' /etc/kubernetes/kubelet/kubelet-config.json
+
+# LỖI 21: Vô hiệu hóa xoay vòng chứng chỉ server (FeatureGate)
+sed -i 's/"RotateKubeletServerCertificate": true/"RotateKubeletServerCertificate": false/g' /etc/kubernetes/kubelet/kubelet-config.json
+
+# Restart Kubelet để áp dụng cấu hình lỗi
+systemctl restart kubelet
 
 --==MYBOUNDARY==--
 EOF
