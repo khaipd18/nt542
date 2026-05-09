@@ -80,11 +80,19 @@ resource "aws_iam_role_policy_attachment" "node_p2" {
   role       = aws_iam_role.node_role.name
 }
 
+
+
 # ❌ LỖI 4: CIS 5.1.3 - Thay vì ReadOnly, gán luôn quyền Admin cho Node thao tác với ECR
 resource "aws_iam_role_policy_attachment" "node_p3" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess"
   role       = aws_iam_role.node_role.name
 }
+
+resource "aws_iam_role_policy_attachment" "node_p4" {
+  policy_arn = aws_iam_role_policy_attachment.node_group_AmazonSSMManagedInstanceCore
+  role       = aws_iam_role.node_role.name
+}
+
 
 # ====================================================================
 # PHẦN 2: CONTROL PLANE & CLUSTER CONFIG (CIS MỤC 2 & 5)
