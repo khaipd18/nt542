@@ -112,64 +112,65 @@ resource "aws_eks_addon" "vpc_cni" {
 resource "aws_launch_template" "vuln_lt" {
   name = "ctf-vuln-os"
 
+  metadata_options {
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2  
+    http_endpoint               = "enabled"
+  }
+
   user_data = base64encode(<<-EOF
-MIME-Version: 1.0
-Content-Type: multipart/mixed; boundary="==MYBOUNDARY=="
+    MIME-Version: 1.0
+    Content-Type: multipart/mixed; boundary="BOUNDARY"
 
---==MYBOUNDARY==
-Content-Type: text/x-shellscript; charset="us-ascii"
+    --BOUNDARY
+    Content-Type: text/x-shellscript; charset="us-ascii"
 
-#!/bin/bash
-set -ex
+    #!/bin/bash
+    set -eux
 
-# Đợi file cấu hình Kubelet được tạo ra bởi script bootstrap của AWS
-while [ ! -f /etc/kubernetes/kubelet/config.json ]; do
-  sleep 5
-done
+    sleep 60
 
-# Cài đặt jq nếu chưa có
-sudo yum install -y jq
+    # Cài đặt jq nếu chưa có
+    sudo yum install -y jq
 
-# --- CỐ TÌNH TẠO LỖI ĐỂ AUDIT (MỤC 3 CIS) ---
+    # ❌ LỖI 10 & 11: CIS 3.1.1, 3.1.2 - Sai quyền và chủ sở hữu kubeconfig
+    sudo chmod 777 /var/lib/kubelet/kubeconfig
+    sudo chown ec2-user:ec2-user /var/lib/kubelet/kubeconfig
 
-# ❌ LỖI 10 & 11: CIS 3.1.1, 3.1.2 - Sai quyền và chủ sở hữu kubeconfig
-sudo chmod 777 /var/lib/kubelet/kubeconfig
-sudo chown ec2-user:ec2-user /var/lib/kubelet/kubeconfig
+    # ❌ LỖI 12 & 13: CIS 3.1.3, 3.1.4 - Sai quyền và chủ sở hữu config.json
+    sudo chmod 777 /etc/kubernetes/kubelet/config.json
+    sudo chown ec2-user:ec2-user /etc/kubernetes/kubelet/config.json
 
-# ❌ LỖI 12 & 13: CIS 3.1.3, 3.1.4 - Sai quyền và chủ sở hữu config.json
-sudo chmod 777 /etc/kubernetes/kubelet/config.json
-sudo chown ec2-user:ec2-user /etc/kubernetes/kubelet/config.json
+    # ❌ LỖI 14: CIS 3.2.1 - Bật xác thực ẩn danh
+    sudo jq '.authentication.anonymous.enabled = true' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
 
-# ❌ LỖI 14: CIS 3.2.1 - Bật xác thực ẩn danh
-sudo jq '.authentication.anonymous.enabled = true' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
+    # ❌ LỖI 15: CIS 3.2.2 - Cấp quyền AlwaysAllow
+    sudo jq '.authentication.webhook.enabled = false' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
+    sudo jq '.authorization.mode = "AlwaysAllow"' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
 
-# ❌ LỖI 15: CIS 3.2.2 - Cấp quyền AlwaysAllow
-sudo jq '.authentication.webhook.enabled = false' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
-sudo jq '.authorization.mode = "AlwaysAllow"' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
+    # ❌ LỖI 16: CIS 3.2.4 - Mở cổng Read-Only 10255
+    sudo jq '.readOnlyPort = 10255' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
 
-# ❌ LỖI 16: CIS 3.2.4 - Mở cổng Read-Only 10255
-sudo jq '.readOnlyPort = 10255' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
+    # ❌ LỖI 17: CIS 3.2.5 - Hủy bỏ Timeout của Streaming Connection
+    sudo jq '.streamingConnectionIdleTimeout = "0"' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
 
-# ❌ LỖI 17: CIS 3.2.5 - Hủy bỏ Timeout của Streaming Connection
-sudo jq '.streamingConnectionIdleTimeout = "0"' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
+    # ❌ LỖI 18: CIS 3.2.6 - Cấm Kubelet quản lý iptables
+    sudo jq '.makeIPTablesUtilChains = false' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
 
-# ❌ LỖI 18: CIS 3.2.6 - Cấm Kubelet quản lý iptables
-sudo jq '.makeIPTablesUtilChains = false' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
+    # ❌ LỖI 19: CIS 3.2.8 - Tắt xoay vòng chứng chỉ Client
+    sudo jq '.rotateCertificates = false' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
 
-# ❌ LỖI 19: CIS 3.2.8 - Tắt xoay vòng chứng chỉ Client
-sudo jq '.rotateCertificates = false' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
+    # ❌ LỖI 20: CIS 3.2.9 - Tắt xoay vòng chứng chỉ Kubelet Server
+    sudo jq '.serverTLSBootstrap = false' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
+    sudo jq '.featureGates.RotateKubeletServerCertificate = false' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
 
-# ❌ LỖI 20: CIS 3.2.9 - Tắt xoay vòng chứng chỉ Kubelet Server
-sudo jq '.serverTLSBootstrap = false' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
-sudo jq '.featureGates.RotateKubeletServerCertificate = false' /etc/kubernetes/kubelet/config.json > /tmp/config.json && sudo mv /tmp/config.json /etc/kubernetes/kubelet/config.json
+    # Restart Kubelet để áp dụng cấu hình lỗi
+    sudo systemctl daemon-reload 
+    sudo systemctl restart kubelet.service 
+    sudo systemctl status kubelet -l 
 
-# Restart Kubelet để áp dụng cấu hình lỗi
-sudo systemctl daemon-reload 
-sudo systemctl restart kubelet.service 
-sudo systemctl status kubelet -l 
-
---==MYBOUNDARY==--
-EOF
+    --BOUNDARY--
+  EOF
   )
 }
 
@@ -185,7 +186,7 @@ resource "aws_eks_node_group" "vuln_nodes" {
     min_size     = 1
   }
   launch_template {
-    name    = aws_launch_template.vuln_lt.name
+    id    = aws_launch_template.vuln_lt.id
     version = aws_launch_template.vuln_lt.latest_version
   }
 }

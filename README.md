@@ -1,4 +1,4 @@
-# Hướng dẫn chạy Terraform và file Audit + Remediation
+# Hướng dẫn chạy Terraform và file Simulation + Audit + Remediation
 
 ## Apply Terraform
 
@@ -50,19 +50,17 @@ terraform destroy -auto-approve # Không cần nhập "Yes"
 
 ---
 
-## Chạy file Audit
-
-### File Audit của Nhóm 3 (Lỗi 10 đến 20)
+## Chuẩn bị môi trường chạy script Python
 
 ***Khuyến nghị: nên chạy các lệnh sau trong Terminal của Command Prompt/PowerShell hoặc Ubuntu/WSL2, không nên chạy trong Git Bash***
 
-```
-cd audit/modules/
-```
+1. **Tạo môi trường ảo**
 
 ```
 python -m venv venv
 ```
+
+2. **Kích hoạt môi trường ảo**
 
 ```
 # Đối với Command Prompt trên Window
@@ -75,14 +73,53 @@ python -m venv venv
 source ./venv/bin/activate
 ```
 
+3. **Tải thư viện cần thiết để chạy script**
+
 ```
+# Tải thư viện boto3
 pip install boto3
 ```
 
+4. **Thoát môi trường ảo**
+
 ```
-python cis_3_eks_worker_nodes.py
+deactivate
+```
+
+---
+
+## Chạy file Simulation
+
+### File Simulation của Nhóm 3 (Lỗi 10 đến 20)
+
+***Lưu ý: phải kích hoạt môi trường ảo trước khi chạy script***
+
+```
+cd simulation
+```
+
+```
+python cis_3_eks_worker_nodes.py --instance-id <EC2_INSTANCE_ID> --region <AWS_REGION>
 # hoặc
-python3 cis_3_eks_worker_nodes.py
+python3 cis_3_eks_worker_nodes.py --instance-id <EC2_INSTANCE_ID> --region <AWS_REGION>
+```
+
+---
+
+## Chạy file Audit
+
+### File Audit của Nhóm 3 (Lỗi 10 đến 20)
+
+***Lưu ý: phải kích hoạt môi trường ảo trước khi chạy script***
+
+```
+cd audit/modules/
+```
+
+```
+python cis_3_eks_worker_nodes.py --instance-id <EC2_INSTANCE_ID> --region <AWS_REGION>
+# hoặc
+python3 cis_3_eks_worker_nodes.py --instance-id <EC2_INSTANCE_ID> --region <AWS_REGION>
 ```
 
 ---
@@ -91,33 +128,14 @@ python3 cis_3_eks_worker_nodes.py
 
 ### File Remediation của Nhóm 3 (Lỗi 10 đến 20)
 
-***Khuyến nghị: nên chạy các lệnh sau trong Terminal của Command Prompt/PowerShell hoặc Ubuntu/WSL2, không nên chạy trong Git Bash***
+***Lưu ý: phải kích hoạt môi trường ảo trước khi chạy script***
 
 ```
 cd remediation/modules/
 ```
 
 ```
-python -m venv venv
-```
-
-```
-# Đối với Command Prompt trên Window
-.\venv\Scripts\activate
-
-# Đối với PowerShell
-.\venv\Scripts\Activate.ps1
-
-# Đối với Ubuntu/WSL2
-source ./venv/bin/activate
-```
-
-```
-pip install boto3
-```
-
-```
-python cis_3_eks_worker_nodes.py
+python cis_3_eks_worker_nodes.py --instance-id <EC2_INSTANCE_ID> --region <AWS_REGION>
 # hoặc
-python3 cis_3_eks_worker_nodes.py
+python3 cis_3_eks_worker_nodes.py --instance-id <EC2_INSTANCE_ID> --region <AWS_REGION>
 ```
