@@ -1,666 +1,360 @@
-#!/usr/bin/env python3
-"""CIS Amazon EKS Benchmark v1.8.0 - Worker Nodes audit (Section 3 only).
-
-This script audits recommendations 3.1.1-3.1.4 and 3.2.1-3.2.9 by creating a
-privileged DaemonSet that mounts the node root filesystem at /host. It then
-reads kubelet configuration files and kubelet process command-line arguments
-from the host filesystem, producing PASS/FAIL results per node.
-
-Designed for local execution on a machine that has kubectl access to the EKS
-cluster.
+"""
+audit.py — CIS Benchmark Audit cho EKS Node (kubelet) qua AWS SSM
+Sử dụng: python audit.py --instance-id <EC2_INSTANCE_ID> [--region <AWS_REGION>]
 """
 
-from __future__ import annotations
-
 import argparse
-import json
-import os
-import re
-import shlex
-import subprocess
-import sys
-import tempfile
-import textwrap
 import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import boto3
 
+# ──────────────────────────────────────────────
+# Helpers: SSM
+# ──────────────────────────────────────────────
 
-NAMESPACE = "cis-worker-node-audit"
-APP_LABEL = "cis-worker-node-audit"
-DAEMONSET_NAME = "cis-worker-node-audit"
-DEFAULT_TIMEOUT_SECONDS = 300
-POLL_INTERVAL_SECONDS = 3
-
-KUBECONFIG_CANDIDATES = [
-    "/var/lib/kubelet/kubeconfig",
-    "/etc/kubernetes/kubelet/kubeconfig",
-]
-
-KUBELET_CONFIG_CANDIDATES = [
-    "/etc/kubernetes/kubelet/config.json",
-    "/etc/kubernetes/kubelet/kubelet-config.json",
-    "/var/lib/kubelet/config.json",
-    "/var/lib/kubelet/config.yaml",
-    "/var/lib/kubelet/config.yml",
-]
-
-
-@dataclass
-class Finding:
-    node: str
-    control: str
-    status: str
-    evidence: str
-    details: str = ""
-
-
-class AuditError(RuntimeError):
-    pass
-
-
-def run(cmd: List[str], *, input_text: Optional[str] = None, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(
-        cmd,
-        input=input_text,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
+def run_command(ssm_client, instance_id, command, timeout=30):
+    """
+    Gửi 1 shell command tới EC2 qua SSM, đợi kết quả và trả về stdout (str).
+    Raise RuntimeError nếu command thất bại hoặc timeout.
+    """
+    response = ssm_client.send_command(
+        InstanceIds=[instance_id],
+        DocumentName="AWS-RunShellScript",
+        Parameters={"commands": [command]},
+        TimeoutSeconds=timeout,
     )
-    if check and proc.returncode != 0:
-        raise AuditError(
-            f"Command failed ({proc.returncode}): {' '.join(cmd)}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
-        )
-    return proc
+    command_id = response["Command"]["CommandId"]
 
-
-def kubectl(*args: str, input_text: Optional[str] = None, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    return run(["kubectl", *args], input_text=input_text, check=check, timeout=timeout)
-
-
-def ensure_namespace() -> None:
-    manifest = textwrap.dedent(
-        f"""
-        apiVersion: v1
-        kind: Namespace
-        metadata:
-          name: {NAMESPACE}
-          labels:
-            pod-security.kubernetes.io/enforce: privileged
-            pod-security.kubernetes.io/enforce-version: latest
-            pod-security.kubernetes.io/audit: privileged
-            pod-security.kubernetes.io/warn: privileged
-        """
-    ).strip() + "\n"
-    kubectl("apply", "-f", "-", input_text=manifest)
-
-
-def apply_daemonset() -> None:
-    manifest = textwrap.dedent(
-        f"""
-        apiVersion: apps/v1
-        kind: DaemonSet
-        metadata:
-          name: {DAEMONSET_NAME}
-          namespace: {NAMESPACE}
-          labels:
-            app: {APP_LABEL}
-        spec:
-          selector:
-            matchLabels:
-              app: {APP_LABEL}
-          updateStrategy:
-            type: RollingUpdate
-          template:
-            metadata:
-              labels:
-                app: {APP_LABEL}
-            spec:
-              automountServiceAccountToken: false
-              terminationGracePeriodSeconds: 0
-              tolerations:
-                - operator: Exists
-              volumes:
-                - name: host-root
-                  hostPath:
-                    path: /
-                    type: Directory
-              containers:
-                - name: host-audit
-                  image: busybox:1.36.1
-                  imagePullPolicy: IfNotPresent
-                  command: ["sh", "-c", "sleep 36000"]
-                  securityContext:
-                    privileged: true
-                    runAsUser: 0
-                  volumeMounts:
-                    - name: host-root
-                      mountPath: /host
-                      readOnly: true
-        """
-    ).strip() + "\n"
-    kubectl("apply", "-f", "-", input_text=manifest)
-
-
-def delete_resources() -> None:
-    # Best effort cleanup.
-    kubectl("delete", "daemonset", DAEMONSET_NAME, "-n", NAMESPACE, "--ignore-not-found=true", check=False)
-    kubectl("delete", "namespace", NAMESPACE, "--ignore-not-found=true", check=False)
-
-
-def wait_for_daemonset_ready(timeout: int = DEFAULT_TIMEOUT_SECONDS) -> None:
+    # Đợi tối đa timeout giây
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            ds = kubectl("get", "daemonset", DAEMONSET_NAME, "-n", NAMESPACE, "-o", "json").stdout
-            data = json.loads(ds)
-            desired = int(data.get("status", {}).get("desiredNumberScheduled", 0))
-            ready = int(data.get("status", {}).get("numberReady", 0))
-            if desired > 0 and ready >= desired:
-                return
-        except Exception:
-            pass
-        time.sleep(POLL_INTERVAL_SECONDS)
-    raise AuditError(f"DaemonSet {DAEMONSET_NAME} did not become ready within {timeout} seconds")
+        time.sleep(2)
+        result = ssm_client.get_command_invocation(
+            CommandId=command_id,
+            InstanceId=instance_id,
+        )
+        status = result["Status"]
+        if status in ("Success", "Failed", "Cancelled", "TimedOut"):
+            break
+    else:
+        raise RuntimeError(f"SSM command timeout sau {timeout}s: {command}")
+
+    if status != "Success":
+        stderr = result.get("StandardErrorContent", "").strip()
+        raise RuntimeError(f"Command thất bại (status={status}): {stderr}")
+
+    return result.get("StandardOutputContent", "").strip()
 
 
-def get_pods() -> List[Dict[str, Any]]:
-    raw = kubectl("get", "pods", "-n", NAMESPACE, "-l", f"app={APP_LABEL}", "-o", "json").stdout
-    data = json.loads(raw)
-    return data.get("items", [])
+# ──────────────────────────────────────────────
+# Bước 0: Kiểm tra điều kiện tiên quyết
+# ──────────────────────────────────────────────
 
+def check_prerequisites(ssm_client, instance_id):
+    """
+    Kiểm tra kubelet đang running và config path đúng.
+    Trả về True nếu hợp lệ, False nếu không.
+    """
+    print("=" * 60)
+    print("KIỂM TRA ĐIỀU KIỆN TIÊN QUYẾT")
+    print("=" * 60)
 
-def exec_in_pod(pod: str, script: str, timeout: int = 120) -> str:
-    proc = kubectl(
-        "exec",
-        "-n",
-        NAMESPACE,
-        pod,
-        "--",
-        "sh",
-        "-c",
-        script,
-        timeout=timeout,
-    )
-    return proc.stdout
-
-
-def host_path(path: str) -> str:
-    return "/host" + path if path.startswith("/") else path
-
-
-def path_exists_in_pod(pod: str, path: str) -> bool:
-    p = host_path(path)
-    script = f'if [ -e {shlex.quote(p)} ]; then echo YES; else echo NO; fi'
-    return exec_in_pod(pod, script).strip() == "YES"
-
-
-def stat_in_pod(pod: str, path: str) -> Optional[Tuple[str, str, str]]:
-    p = host_path(path)
-    script = f"""
-    if [ -e {shlex.quote(p)} ]; then
-      stat -c '%a|%U|%G' {shlex.quote(p)}
-    fi
-    """.strip()
-    out = exec_in_pod(pod, script).strip()
-    if not out:
-        return None
-    parts = out.split("|")
-    if len(parts) != 3:
-        return None
-    return parts[0], parts[1], parts[2]
-
-
-def cat_in_pod(pod: str, path: str) -> Optional[str]:
-    p = host_path(path)
-    script = f"""
-    if [ -e {shlex.quote(p)} ]; then
-      cat {shlex.quote(p)}
-    fi
-    """.strip()
-    out = exec_in_pod(pod, script).strip()
-    return out if out else None
-
-
-def find_kubelet_cmdline(pod: str) -> Optional[str]:
-    script = r'''
-    for f in /host/proc/[0-9]*/cmdline; do
-      [ -r "$f" ] || continue
-      cmd=$(tr '\000' ' ' < "$f" | sed 's/[[:space:]]\+/ /g')
-      case "$cmd" in
-        *kubelet*)
-          echo "$cmd"
-          exit 0
-          ;;
-      esac
-    done
-    exit 1
-    '''.strip()
-    proc = kubectl("exec", "-n", NAMESPACE, pod, "--", "sh", "-c", script, check=False)
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.strip() or None
-
-
-def parse_cmdline(cmdline: str) -> Dict[str, Optional[str]]:
-    tokens = shlex.split(cmdline)
-    args: Dict[str, Optional[str]] = {}
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok.startswith("--"):
-            key = tok[2:]
-            value: Optional[str] = None
-            if "=" in key:
-                key, value = key.split("=", 1)
-            elif i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
-                value = tokens[i + 1]
-                i += 1
-            else:
-                value = None
-            args[key.lower()] = value
-        i += 1
-    return args
-
-
-def normalize_key(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", s.lower())
-
-
-def lookup_case_insensitive(mapping: Any, key: str) -> Any:
-    if not isinstance(mapping, dict):
-        return None
-    wanted = normalize_key(key)
-    for k, v in mapping.items():
-        if normalize_key(str(k)) == wanted:
-            return v
-    return None
-
-
-def parse_config_text(text: str) -> Optional[Any]:
-    stripped = text.lstrip()
-    if not stripped:
-        return None
-    if stripped.startswith("{"):
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return None
+    # 1. Kubelet có đang running?
     try:
-        import yaml  # type: ignore
-
-        return yaml.safe_load(text)
-    except Exception:
-        return None
-
-
-def config_value(config: Any, *path: str) -> Any:
-    cur = config
-    for part in path:
-        cur = lookup_case_insensitive(cur, part)
-        if cur is None:
-            return None
-    return cur
-
-
-def as_bool(value: Any) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return bool(value)
-    s = str(value).strip().lower()
-    if s in {"true", "t", "yes", "y", "1"}:
-        return True
-    if s in {"false", "f", "no", "n", "0"}:
+        out = run_command(ssm_client, instance_id, "sudo systemctl status kubelet")
+        if "Active: active (running)" in out:
+            print("[OK] kubelet đang running.")
+        else:
+            print("[FAIL] kubelet KHÔNG ở trạng thái active (running).")
+            print(f"       Output: {out[:200]}")
+            return False
+    except RuntimeError as e:
+        print(f"[ERROR] Không thể kiểm tra kubelet status: {e}")
         return False
-    return None
 
-
-def as_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
+    # 2. kubelet dùng đúng config file?
     try:
-        return int(str(value).strip())
-    except Exception:
-        return None
-
-
-def is_mode_permissive(mode: str) -> bool:
-    return int(mode, 8) <= 0o644
-
-
-def resolve_paths(cmd_args: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
-    result = {"kubeconfig": None, "config": None}
-    for key in ("kubeconfig",):
-        if key in cmd_args and cmd_args[key]:
-            result[key] = cmd_args[key]
-    if "config" in cmd_args and cmd_args["config"]:
-        result["config"] = cmd_args["config"]
-    return result
-
-
-def infer_existing_path(pod: str, candidates: List[str]) -> Optional[str]:
-    for p in candidates:
-        if path_exists_in_pod(pod, p):
-            return p
-    return None
-
-
-def file_stat_string(stat_result: Optional[Tuple[str, str, str]]) -> str:
-    if not stat_result:
-        return "missing"
-    mode, owner, group = stat_result
-    return f"mode={mode} owner={owner}:{group}"
-
-
-def audit_node(node: str, pod: str) -> List[Finding]:
-    findings: List[Finding] = []
-
-    cmdline = find_kubelet_cmdline(pod)
-    if not cmdline:
-        # Without kubelet args we cannot reliably audit section 3.
-        for control in [
-            "3.1.1", "3.1.2", "3.1.3", "3.1.4",
-            "3.2.1", "3.2.2", "3.2.3", "3.2.4", "3.2.5", "3.2.6", "3.2.7", "3.2.8", "3.2.9",
-        ]:
-            findings.append(Finding(node, control, "FAIL", "kubelet process not found in host /proc", "Cannot read node-level kubelet configuration."))
-        return findings
-
-    args = parse_cmdline(cmdline)
-    paths = resolve_paths(args)
-    kubeconfig_path = paths["kubeconfig"] or infer_existing_path(pod, KUBECONFIG_CANDIDATES)
-    config_path = paths["config"] or infer_existing_path(pod, KUBELET_CONFIG_CANDIDATES)
-
-    # 3.1.1 / 3.1.2 kubeconfig file checks
-    if kubeconfig_path:
-        stat_res = stat_in_pod(pod, kubeconfig_path)
-        if not stat_res:
-            findings.append(Finding(node, "3.1.1", "FAIL", f"{kubeconfig_path}: missing", "kubeconfig file not found on host"))
-            findings.append(Finding(node, "3.1.2", "FAIL", f"{kubeconfig_path}: missing", "kubeconfig file not found on host"))
+        out = run_command(ssm_client, instance_id, "ps -ef | grep kubelet")
+        if "--config=/etc/kubernetes/kubelet/config.json" in out:
+            print("[OK] kubelet sử dụng --config=/etc/kubernetes/kubelet/config.json.")
         else:
-            mode, owner, group = stat_res
-            mode_ok = is_mode_permissive(mode)
-            owner_ok = (owner == "root" and group == "root")
-            findings.append(
-                Finding(
-                    node,
-                    "3.1.1",
-                    "PASS" if mode_ok else "FAIL",
-                    f"{kubeconfig_path}: {file_stat_string(stat_res)}",
-                    "permissions are 644 or more restrictive" if mode_ok else "permissions are too open",
-                )
-            )
-            findings.append(
-                Finding(
-                    node,
-                    "3.1.2",
-                    "PASS" if owner_ok else "FAIL",
-                    f"{kubeconfig_path}: {file_stat_string(stat_res)}",
-                    "owned by root:root" if owner_ok else "ownership is not root:root",
-                )
-            )
-    else:
-        findings.append(Finding(node, "3.1.1", "FAIL", "kubeconfig path not discovered", "No kubeconfig path found in kubelet args or common locations"))
-        findings.append(Finding(node, "3.1.2", "FAIL", "kubeconfig path not discovered", "No kubeconfig path found in kubelet args or common locations"))
+            print("[FAIL] Không tìm thấy --config=/etc/kubernetes/kubelet/config.json trong process kubelet.")
+            print(f"       Output: {out[:300]}")
+            return False
+    except RuntimeError as e:
+        print(f"[ERROR] Không thể kiểm tra kubelet process: {e}")
+        return False
 
-    config = None
-    if config_path:
-        config_text = cat_in_pod(pod, config_path)
-        if config_text:
-            config = parse_config_text(config_text)
-
-    # 3.1.3 / 3.1.4 kubelet config file checks
-    if config_path:
-        stat_res = stat_in_pod(pod, config_path)
-        if not stat_res:
-            findings.append(Finding(node, "3.1.3", "FAIL", f"{config_path}: missing", "kubelet config file not found on host"))
-            findings.append(Finding(node, "3.1.4", "FAIL", f"{config_path}: missing", "kubelet config file not found on host"))
-        else:
-            mode, owner, group = stat_res
-            mode_ok = is_mode_permissive(mode)
-            owner_ok = (owner == "root" and group == "root")
-            findings.append(
-                Finding(
-                    node,
-                    "3.1.3",
-                    "PASS" if mode_ok else "FAIL",
-                    f"{config_path}: {file_stat_string(stat_res)}",
-                    "permissions are 644 or more restrictive" if mode_ok else "permissions are too open",
-                )
-            )
-            findings.append(
-                Finding(
-                    node,
-                    "3.1.4",
-                    "PASS" if owner_ok else "FAIL",
-                    f"{config_path}: {file_stat_string(stat_res)}",
-                    "owned by root:root" if owner_ok else "ownership is not root:root",
-                )
-            )
-    else:
-        findings.append(Finding(node, "3.1.3", "FAIL", "kubelet config path not discovered", "No kubelet config path found in kubelet args or common locations"))
-        findings.append(Finding(node, "3.1.4", "FAIL", "kubelet config path not discovered", "No kubelet config path found in kubelet args or common locations"))
-
-    # 3.2.1 Anonymous auth not enabled
-    anon_arg = args.get("anonymous-auth")
-    anon_cfg = None
-    if config is not None:
-        anon_cfg = as_bool(config_value(config, "authentication", "anonymous", "enabled"))
-    if anon_arg is not None:
-        anon_val = as_bool(anon_arg)
-        pass_ = (anon_val is False)
-        findings.append(Finding(node, "3.2.1", "PASS" if pass_ else "FAIL", f"cmdline anonymous-auth={anon_arg}", "anonymous auth disabled" if pass_ else "anonymous auth enabled"))
-    elif anon_cfg is not None:
-        pass_ = (anon_cfg is False)
-        findings.append(Finding(node, "3.2.1", "PASS" if pass_ else "FAIL", f"config authentication.anonymous.enabled={anon_cfg}", "anonymous auth disabled" if pass_ else "anonymous auth enabled"))
-    else:
-        findings.append(Finding(node, "3.2.1", "FAIL", "anonymous-auth not explicitly found", "could not confirm anonymous auth is disabled"))
-
-    # 3.2.2 authorization-mode not AlwaysAllow (prefer Webhook)
-    authz_arg = args.get("authorization-mode")
-    authz_cfg = None
-    if config is not None:
-        authz_cfg = config_value(config, "authorization", "mode")
-    if authz_arg is not None:
-        authz_val = str(authz_arg).strip()
-        pass_ = authz_val.lower() == "webhook"
-        findings.append(Finding(node, "3.2.2", "PASS" if pass_ else "FAIL", f"cmdline authorization-mode={authz_val}", "set to Webhook" if pass_ else "not set to Webhook"))
-    elif authz_cfg is not None:
-        authz_val = str(authz_cfg).strip()
-        pass_ = authz_val.lower() == "webhook"
-        findings.append(Finding(node, "3.2.2", "PASS" if pass_ else "FAIL", f"config authorization.mode={authz_val}", "set to Webhook" if pass_ else "not set to Webhook"))
-    else:
-        findings.append(Finding(node, "3.2.2", "FAIL", "authorization mode not explicitly found", "could not confirm authorization mode is Webhook"))
-
-    # 3.2.3 client CA file configured
-    ca_arg = args.get("client-ca-file")
-    ca_cfg = None
-    if config is not None:
-        ca_cfg = config_value(config, "authentication", "x509", "clientCAFile")
-    if ca_arg:
-        pass_ = path_exists_in_pod(pod, str(ca_arg))
-        findings.append(Finding(node, "3.2.3", "PASS" if pass_ else "FAIL", f"cmdline client-ca-file={ca_arg}", "client CA file exists" if pass_ else "client CA file not found"))
-    elif ca_cfg:
-        pass_ = path_exists_in_pod(pod, str(ca_cfg))
-        findings.append(Finding(node, "3.2.3", "PASS" if pass_ else "FAIL", f"config authentication.x509.clientCAFile={ca_cfg}", "client CA file exists" if pass_ else "client CA file not found"))
-    else:
-        findings.append(Finding(node, "3.2.3", "FAIL", "client CA file not explicitly found", "could not confirm client CA file is configured"))
-
-    # 3.2.4 read-only port disabled
-    ro_arg = args.get("read-only-port")
-    ro_cfg = None
-    if config is not None:
-        ro_cfg = as_int(config_value(config, "readOnlyPort"))
-    if ro_arg is not None:
-        ro_val = as_int(ro_arg)
-        pass_ = (ro_val == 0)
-        findings.append(Finding(node, "3.2.4", "PASS" if pass_ else "FAIL", f"cmdline read-only-port={ro_arg}", "read-only port disabled" if pass_ else "read-only port enabled"))
-    elif ro_cfg is not None:
-        pass_ = (ro_cfg == 0)
-        findings.append(Finding(node, "3.2.4", "PASS" if pass_ else "FAIL", f"config readOnlyPort={ro_cfg}", "read-only port disabled" if pass_ else "read-only port enabled"))
-    else:
-        # Kubelet default is disabled on modern versions; absence alone isn't enough evidence of failure.
-        findings.append(Finding(node, "3.2.4", "PASS", "read-only port not explicitly set", "treated as compliant unless an explicit non-zero value is found"))
-
-    # 3.2.5 streaming connection idle timeout not 0
-    s_arg = args.get("streaming-connection-idle-timeout")
-    s_cfg = None
-    if config is not None:
-        s_cfg = config_value(config, "streamingConnectionIdleTimeout")
-    if s_arg is not None:
-        s_val = str(s_arg).strip()
-        pass_ = s_val not in {"0", "0s", "0m", "0h", "0h0m0s"}
-        findings.append(Finding(node, "3.2.5", "PASS" if pass_ else "FAIL", f"cmdline streaming-connection-idle-timeout={s_val}", "timeout is non-zero" if pass_ else "timeout is 0"))
-    elif s_cfg is not None:
-        s_val = str(s_cfg).strip()
-        pass_ = s_val not in {"0", "0s", "0m", "0h", "0h0m0s"}
-        findings.append(Finding(node, "3.2.5", "PASS" if pass_ else "FAIL", f"config streamingConnectionIdleTimeout={s_val}", "timeout is non-zero" if pass_ else "timeout is 0"))
-    else:
-        findings.append(Finding(node, "3.2.5", "PASS", "streamingConnectionIdleTimeout not explicitly set", "default/inherited value not observed as 0"))
-
-    # 3.2.6 make-iptables-util-chains true
-    ipt_arg = args.get("make-iptables-util-chains")
-    ipt_cfg = None
-    if config is not None:
-        ipt_cfg = as_bool(config_value(config, "makeIPTablesUtilChains"))
-    if ipt_arg is not None:
-        pass_ = as_bool(ipt_arg) is True
-        findings.append(Finding(node, "3.2.6", "PASS" if pass_ else "FAIL", f"cmdline make-iptables-util-chains={ipt_arg}", "set to true" if pass_ else "not true"))
-    elif ipt_cfg is not None:
-        pass_ = ipt_cfg is True
-        findings.append(Finding(node, "3.2.6", "PASS" if pass_ else "FAIL", f"config makeIPTablesUtilChains={ipt_cfg}", "set to true" if pass_ else "not true"))
-    else:
-        findings.append(Finding(node, "3.2.6", "PASS", "makeIPTablesUtilChains not explicitly set", "default/inherited value not observed as false"))
-
-    # 3.2.7 eventRecordQPS appropriate (benchmark allows 0 or a suitable level)
-    event_arg = args.get("eventrecordqps")
-    event_cfg = None
-    if config is not None:
-        event_cfg = as_int(config_value(config, "eventRecordQPS"))
-    chosen = event_arg if event_arg is not None else event_cfg
-    if chosen is not None:
-        ev = as_int(chosen)
-        if ev is None:
-            findings.append(Finding(node, "3.2.7", "FAIL", f"eventRecordQPS={chosen}", "value is not numeric"))
-        elif ev < 0:
-            findings.append(Finding(node, "3.2.7", "FAIL", f"eventRecordQPS={ev}", "negative value is invalid"))
-        else:
-            findings.append(Finding(node, "3.2.7", "PASS", f"eventRecordQPS={ev}", "numeric value is set; review whether it matches your event-capture needs"))
-    else:
-        findings.append(Finding(node, "3.2.7", "PASS", "eventRecordQPS not explicitly set", "default/inherited value not observed as invalid"))
-
-    # 3.2.8 rotate-certificates present or true
-    rot_arg = args.get("rotate-certificates")
-    rot_cfg = None
-    if config is not None:
-        rot_cfg = as_bool(config_value(config, "rotateCertificates"))
-    if rot_arg is not None:
-        pass_ = as_bool(rot_arg) is not False
-        findings.append(Finding(node, "3.2.8", "PASS" if pass_ else "FAIL", f"cmdline rotate-certificates={rot_arg}", "true/omitted-style compliant" if pass_ else "explicitly false"))
-    elif rot_cfg is not None:
-        pass_ = rot_cfg is not False
-        findings.append(Finding(node, "3.2.8", "PASS" if pass_ else "FAIL", f"config rotateCertificates={rot_cfg}", "true/omitted-style compliant" if pass_ else "explicitly false"))
-    else:
-        findings.append(Finding(node, "3.2.8", "PASS", "rotateCertificates not explicitly set", "no explicit false value found"))
-
-    # 3.2.9 RotateKubeletServerCertificate true
-    rk_arg = args.get("rotate-kubelet-server-certificate")
-    rk_cfg = None
-    if config is not None:
-        fg = config_value(config, "featureGates")
-        if isinstance(fg, dict):
-            rk_cfg = as_bool(lookup_case_insensitive(fg, "RotateKubeletServerCertificate"))
-    if rk_arg is not None:
-        pass_ = as_bool(rk_arg) is True
-        findings.append(Finding(node, "3.2.9", "PASS" if pass_ else "FAIL", f"cmdline rotate-kubelet-server-certificate={rk_arg}", "set to true" if pass_ else "not true"))
-    elif rk_cfg is not None:
-        pass_ = rk_cfg is True
-        findings.append(Finding(node, "3.2.9", "PASS" if pass_ else "FAIL", f"config featureGates.RotateKubeletServerCertificate={rk_cfg}", "set to true" if pass_ else "not true"))
-    else:
-        findings.append(Finding(node, "3.2.9", "FAIL", "RotateKubeletServerCertificate not explicitly found", "benchmark expects this feature gate to be true"))
-
-    return findings
-
-
-def get_node_pods() -> List[Tuple[str, str]]:
-    items = get_pods()
-    pairs: List[Tuple[str, str]] = []
-    for item in items:
-        node = item.get("spec", {}).get("nodeName")
-        pod = item.get("metadata", {}).get("name")
-        if node and pod:
-            pairs.append((node, pod))
-    pairs.sort(key=lambda x: x[0])
-    return pairs
-
-
-def print_report(findings: List[Finding]) -> None:
-    findings.sort(key=lambda f: (f.node, f.control))
-    width_node = max(len("NODE"), *(len(f.node) for f in findings)) if findings else 4
-    width_ctrl = max(len("CTRL"), *(len(f.control) for f in findings)) if findings else 4
-    width_status = len("STATUS")
-    print(f"{'NODE'.ljust(width_node)}  {'CTRL'.ljust(width_ctrl)}  {'STATUS'.ljust(width_status)}  EVIDENCE")
-    print(f"{'-'*width_node}  {'-'*width_ctrl}  {'-'*width_status}  {'-'*30}")
-    for f in findings:
-        evidence = f.evidence if len(f.evidence) <= 90 else f.evidence[:87] + "..."
-        print(f"{f.node.ljust(width_node)}  {f.control.ljust(width_ctrl)}  {f.status.ljust(width_status)}  {evidence}")
-        if f.details:
-            print(f"{' '.ljust(width_node)}  {' '.ljust(width_ctrl)}  {' '.ljust(width_status)}  {f.details}")
     print()
-    summary: Dict[str, int] = {"PASS": 0, "FAIL": 0}
-    for f in findings:
-        if f.status in summary:
-            summary[f.status] += 1
+    return True
+
+
+# ──────────────────────────────────────────────
+# Hàm output kết quả
+# ──────────────────────────────────────────────
+
+def report(cis_id, description, status, detail=""):
+    """In kết quả một CIS check ra stdout."""
+    icon = {"Pass": "✅", "Fail": "❌", "Error": "⚠️ "}.get(status, "?")
+    line = f"{icon} [{status:5s}] {cis_id} — {description}"
+    if detail:
+        line += f"\n         Detail: {detail}"
+    print(line)
+    return {"cis_id": cis_id, "description": description, "status": status, "detail": detail}
+
+
+# ──────────────────────────────────────────────
+# Helpers: permission / owner
+# ──────────────────────────────────────────────
+
+def is_permission_ok(perm_str):
+    """
+    Kiểm tra permission có phải 644 hoặc chặt chẽ hơn không.
+    Chặt chẽ hơn nghĩa là: owner<=6, group<=4, other<=4
+    Ví dụ hợp lệ: 600, 640, 644, 400
+    """
+    perm = perm_str.strip()
+    if len(perm) != 3 or not perm.isdigit():
+        return False
+    owner, group, other = int(perm[0]), int(perm[1]), int(perm[2])
+    return owner <= 6 and group <= 4 and other <= 4
+
+
+# ──────────────────────────────────────────────
+# Các hàm audit CIS
+# ──────────────────────────────────────────────
+
+def audit_3_1_1(ssm_client, instance_id):
+    """CIS 3.1.1 — Permission của /var/lib/kubelet/kubeconfig phải là 644 hoặc chặt hơn."""
+    try:
+        out = run_command(ssm_client, instance_id, "stat -c %a /var/lib/kubelet/kubeconfig")
+        if is_permission_ok(out):
+            return report("CIS 3.1.1", "kubeconfig file permission", "Pass", f"permission={out}")
         else:
-            summary.setdefault(f.status, 0)
-            summary[f.status] += 1
-    print("Summary:")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
+            return report("CIS 3.1.1", "kubeconfig file permission", "Fail",
+                          f"permission={out} (yêu cầu 644 hoặc chặt hơn)")
+    except RuntimeError as e:
+        return report("CIS 3.1.1", "kubeconfig file permission", "Error", str(e))
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Audit CIS EKS Worker Node section 3 using a privileged pod method.")
-    parser.add_argument("--no-cleanup", action="store_true", help="Keep the namespace and DaemonSet after the audit")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="Seconds to wait for the DaemonSet to become ready")
-    parser.add_argument("--json", action="store_true", help="Print JSON instead of a human-readable report")
+def audit_3_1_2(ssm_client, instance_id):
+    """CIS 3.1.2 — Owner của /var/lib/kubelet/kubeconfig phải là root:root."""
+    try:
+        out = run_command(ssm_client, instance_id, "stat -c %U:%G /var/lib/kubelet/kubeconfig")
+        if out.strip() == "root:root":
+            return report("CIS 3.1.2", "kubeconfig file owner", "Pass", f"owner={out}")
+        else:
+            return report("CIS 3.1.2", "kubeconfig file owner", "Fail",
+                          f"owner={out} (yêu cầu root:root)")
+    except RuntimeError as e:
+        return report("CIS 3.1.2", "kubeconfig file owner", "Error", str(e))
+
+
+def audit_3_1_3(ssm_client, instance_id):
+    """CIS 3.1.3 — Permission của /etc/kubernetes/kubelet/config.json phải là 644 hoặc chặt hơn."""
+    try:
+        out = run_command(ssm_client, instance_id, "stat -c %a /etc/kubernetes/kubelet/config.json")
+        if is_permission_ok(out):
+            return report("CIS 3.1.3", "kubelet config.json file permission", "Pass", f"permission={out}")
+        else:
+            return report("CIS 3.1.3", "kubelet config.json file permission", "Fail",
+                          f"permission={out} (yêu cầu 644 hoặc chặt hơn)")
+    except RuntimeError as e:
+        return report("CIS 3.1.3", "kubelet config.json file permission", "Error", str(e))
+
+
+def audit_3_1_4(ssm_client, instance_id):
+    """CIS 3.1.4 — Owner của /etc/kubernetes/kubelet/config.json phải là root:root."""
+    try:
+        out = run_command(ssm_client, instance_id, "stat -c %U:%G /etc/kubernetes/kubelet/config.json")
+        if out.strip() == "root:root":
+            return report("CIS 3.1.4", "kubelet config.json file owner", "Pass", f"owner={out}")
+        else:
+            return report("CIS 3.1.4", "kubelet config.json file owner", "Fail",
+                          f"owner={out} (yêu cầu root:root)")
+    except RuntimeError as e:
+        return report("CIS 3.1.4", "kubelet config.json file owner", "Error", str(e))
+
+
+def audit_3_2_1(ssm_client, instance_id):
+    """CIS 3.2.1 — Anonymous Authentication phải là false."""
+    try:
+        out = run_command(
+            ssm_client, instance_id,
+            "sudo jq '.authentication.anonymous.enabled' /etc/kubernetes/kubelet/config.json"
+        )
+        if out.strip() == "false":
+            return report("CIS 3.2.1", "Anonymous Authentication disabled", "Pass", f"value={out}")
+        else:
+            return report("CIS 3.2.1", "Anonymous Authentication disabled", "Fail",
+                          f"value={out} (yêu cầu false)")
+    except RuntimeError as e:
+        return report("CIS 3.2.1", "Anonymous Authentication disabled", "Error", str(e))
+
+
+def audit_3_2_2(ssm_client, instance_id):
+    """CIS 3.2.2 — Webhook Authentication=true và Authorization Mode=Webhook."""
+    try:
+        webhook_enabled = run_command(
+            ssm_client, instance_id,
+            "sudo jq '.authentication.webhook.enabled' /etc/kubernetes/kubelet/config.json"
+        ).strip()
+        auth_mode = run_command(
+            ssm_client, instance_id,
+            "sudo jq '.authorization.mode' /etc/kubernetes/kubelet/config.json"
+        ).strip()
+
+        if webhook_enabled == "true" and auth_mode == '"Webhook"':
+            return report("CIS 3.2.2", "Webhook Auth + Authorization Mode", "Pass",
+                          f"webhook.enabled={webhook_enabled}, authorization.mode={auth_mode}")
+        else:
+            return report("CIS 3.2.2", "Webhook Auth + Authorization Mode", "Fail",
+                          f"webhook.enabled={webhook_enabled} (yêu cầu true), "
+                          f"authorization.mode={auth_mode} (yêu cầu \"Webhook\")")
+    except RuntimeError as e:
+        return report("CIS 3.2.2", "Webhook Auth + Authorization Mode", "Error", str(e))
+
+
+def audit_3_2_4(ssm_client, instance_id):
+    """CIS 3.2.4 — readOnlyPort phải là 0."""
+    try:
+        out = run_command(
+            ssm_client, instance_id,
+            "sudo jq '.readOnlyPort' /etc/kubernetes/kubelet/config.json"
+        )
+        if out.strip() == "0":
+            return report("CIS 3.2.4", "Read-only port disabled", "Pass", f"readOnlyPort={out}")
+        else:
+            return report("CIS 3.2.4", "Read-only port disabled", "Fail",
+                          f"readOnlyPort={out} (yêu cầu 0)")
+    except RuntimeError as e:
+        return report("CIS 3.2.4", "Read-only port disabled", "Error", str(e))
+
+
+def audit_3_2_5(ssm_client, instance_id):
+    """CIS 3.2.5 — streamingConnectionIdleTimeout không được là '0'."""
+    try:
+        out = run_command(
+            ssm_client, instance_id,
+            "sudo jq '.streamingConnectionIdleTimeout' /etc/kubernetes/kubelet/config.json"
+        )
+        # jq trả về "0" (có nháy kép) nếu là string "0"
+        if out.strip() not in ('"0"', "0", "null"):
+            return report("CIS 3.2.5", "streamingConnectionIdleTimeout != 0", "Pass",
+                          f"value={out}")
+        else:
+            return report("CIS 3.2.5", "streamingConnectionIdleTimeout != 0", "Fail",
+                          f"value={out} (không được là 0)")
+    except RuntimeError as e:
+        return report("CIS 3.2.5", "streamingConnectionIdleTimeout != 0", "Error", str(e))
+
+
+def audit_3_2_6(ssm_client, instance_id):
+    """CIS 3.2.6 — makeIPTablesUtilChains phải là true."""
+    try:
+        out = run_command(
+            ssm_client, instance_id,
+            "sudo jq '.makeIPTablesUtilChains' /etc/kubernetes/kubelet/config.json"
+        )
+        if out.strip() == "true":
+            return report("CIS 3.2.6", "makeIPTablesUtilChains=true", "Pass", f"value={out}")
+        else:
+            return report("CIS 3.2.6", "makeIPTablesUtilChains=true", "Fail",
+                          f"value={out} (yêu cầu true)")
+    except RuntimeError as e:
+        return report("CIS 3.2.6", "makeIPTablesUtilChains=true", "Error", str(e))
+
+
+def audit_3_2_8(ssm_client, instance_id):
+    """CIS 3.2.8 — rotateCertificates phải là true hoặc null."""
+    try:
+        out = run_command(
+            ssm_client, instance_id,
+            "sudo jq '.rotateCertificates' /etc/kubernetes/kubelet/config.json"
+        )
+        if out.strip() in ("true", "null"):
+            return report("CIS 3.2.8", "rotateCertificates=true or null", "Pass", f"value={out}")
+        else:
+            return report("CIS 3.2.8", "rotateCertificates=true or null", "Fail",
+                          f"value={out} (yêu cầu true hoặc null)")
+    except RuntimeError as e:
+        return report("CIS 3.2.8", "rotateCertificates=true or null", "Error", str(e))
+
+
+def audit_3_2_9(ssm_client, instance_id):
+    """CIS 3.2.9 — serverTLSBootstrap và RotateKubeletServerCertificate phải là true."""
+    try:
+        tls_bootstrap = run_command(
+            ssm_client, instance_id,
+            "sudo jq '.serverTLSBootstrap' /etc/kubernetes/kubelet/config.json"
+        ).strip()
+        rotate_cert = run_command(
+            ssm_client, instance_id,
+            "sudo jq '.featureGates.RotateKubeletServerCertificate' /etc/kubernetes/kubelet/config.json"
+        ).strip()
+
+        if tls_bootstrap == "true" and rotate_cert == "true":
+            return report("CIS 3.2.9", "serverTLSBootstrap + RotateKubeletServerCertificate", "Pass",
+                          f"serverTLSBootstrap={tls_bootstrap}, RotateKubeletServerCertificate={rotate_cert}")
+        else:
+            return report("CIS 3.2.9", "serverTLSBootstrap + RotateKubeletServerCertificate", "Fail",
+                          f"serverTLSBootstrap={tls_bootstrap} (yêu cầu true), "
+                          f"RotateKubeletServerCertificate={rotate_cert} (yêu cầu true)")
+    except RuntimeError as e:
+        return report("CIS 3.2.9", "serverTLSBootstrap + RotateKubeletServerCertificate", "Error", str(e))
+
+
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="CIS Benchmark Audit cho EKS Node qua SSM")
+    parser.add_argument("--instance-id", required=True, help="EC2 Instance ID (ví dụ: i-0abc123def456)")
+    parser.add_argument("--region", default=None, help="AWS Region (mặc định dùng region trong AWS config)")
     args = parser.parse_args()
 
-    created = False
-    findings: List[Finding] = []
-    try:
-        ensure_namespace()
-        apply_daemonset()
-        created = True
-        wait_for_daemonset_ready(timeout=args.timeout)
+    ssm_client = boto3.client("ssm", region_name=args.region)
 
-        pairs = get_node_pods()
-        if not pairs:
-            raise AuditError("No DaemonSet pods found; cannot audit nodes.")
+    # Bước 0: kiểm tra điều kiện tiên quyết
+    if not check_prerequisites(ssm_client, args.instance_id):
+        print("\n[DỪNG] Điều kiện tiên quyết không thỏa mãn. Không thực hiện audit.")
+        return
 
-        for node, pod in pairs:
-            findings.extend(audit_node(node, pod))
+    # Chạy toàn bộ audit
+    print("=" * 60)
+    print("KẾT QUẢ AUDIT CIS BENCHMARK")
+    print("=" * 60)
 
-        if args.json:
-            print(json.dumps([f.__dict__ for f in findings], indent=2, ensure_ascii=False))
-        else:
-            print_report(findings)
-        return 0
-    except AuditError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
-    finally:
-        if created and not args.no_cleanup:
-            delete_resources()
+    audit_functions = [
+        audit_3_1_1,
+        audit_3_1_2,
+        audit_3_1_3,
+        audit_3_1_4,
+        audit_3_2_1,
+        audit_3_2_2,
+        audit_3_2_4,
+        audit_3_2_5,
+        audit_3_2_6,
+        audit_3_2_8,
+        audit_3_2_9,
+    ]
+
+    results = []
+    for fn in audit_functions:
+        result = fn(ssm_client, args.instance_id)
+        results.append(result)
+
+    # Tổng kết
+    total   = len(results)
+    passed  = sum(1 for r in results if r["status"] == "Pass")
+    failed  = sum(1 for r in results if r["status"] == "Fail")
+    errors  = sum(1 for r in results if r["status"] == "Error")
+
+    print()
+    print("=" * 60)
+    print(f"TỔNG KẾT: {total} checks — Pass: {passed} | Fail: {failed} | Error: {errors}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
