@@ -60,19 +60,37 @@ def wait_for_cluster_idle(cluster_name, region, timeout_seconds=1800, poll_secon
     raise SystemExit("⛔ Hết thời gian chờ cluster idle. Hãy thử lại sau.")
 
 
-def ensure_kube_access(cluster_name, region):
-    """Đảm bảo kubeconfig sẵn sàng và endpoint có thể truy cập trước phần 4."""
+def set_public_endpoint(cluster_name, region):
+    """Bật public endpoint tạm thời để chạy phần 4 từ máy ngoài VPC."""
     eks_client = boto3.client("eks", region_name=region)
     cluster = eks_client.describe_cluster(name=cluster_name)["cluster"]
     vpc_cfg = cluster.get("resourcesVpcConfig", {})
-    is_private = vpc_cfg.get("endpointPrivateAccess", False)
-    is_public = vpc_cfg.get("endpointPublicAccess", False)
 
-    if is_private and not is_public:
-        print(
-            "⚠️  Cluster endpoint đang Private-only. Bạn phải chạy phần 4 từ máy có kết nối VPC "
-            "(VPN/DirectConnect/Bastion/EC2 trong VPC) mới truy cập được API server."
+    if vpc_cfg.get("endpointPublicAccess") is True:
+        return
+
+    print("🔧 Bật public endpoint để chạy REMEDIATION 4...")
+    try:
+        eks_client.update_cluster_config(
+            name=cluster_name,
+            resourcesVpcConfig={
+                "endpointPublicAccess": True,
+                "endpointPrivateAccess": True,
+            },
         )
+    except ClientError as exc:
+        msg = str(exc)
+        if "already at the desired configuration" in msg:
+            return
+        raise
+
+    wait_for_cluster_idle(cluster_name, region)
+
+
+def ensure_kube_access(cluster_name, region):
+    """Đảm bảo kubeconfig sẵn sàng và endpoint có thể truy cập trước phần 4."""
+    # Bật public endpoint tạm để chạy phần 4
+    set_public_endpoint(cluster_name, region)
 
     # Cố gắng cập nhật kubeconfig tự động (nếu có AWS CLI)
     try:
@@ -92,7 +110,7 @@ def ensure_kube_access(cluster_name, region):
         raise SystemExit("⛔ Không tìm thấy kubectl. Hãy cài đặt kubectl rồi chạy lại.")
     except subprocess.CalledProcessError:
         raise SystemExit(
-            "⛔ Không thể kết nối Kubernetes API. Hãy kiểm tra kubeconfig hoặc mạng (nếu private endpoint)."
+            "⛔ Không thể kết nối Kubernetes API. Hãy kiểm tra kubeconfig hoặc mạng."
         )
 
 
