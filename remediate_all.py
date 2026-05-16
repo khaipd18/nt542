@@ -92,6 +92,7 @@ def main():
     target_namespace = env_or_prompt("TARGET_NAMESPACE", default="production", required=True)
 
     print("\n=== [REMEDIATION 1] Infrastructure & IAM (CIS 5.x) ===")
+    wait_for_cluster_idle(cluster_name, region)
     remediate_section_1 = load_remediation_section_1()
     remediate_section_1(cluster_name, repo_name, node_role)
 
