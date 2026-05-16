@@ -2,6 +2,10 @@
 import os
 import importlib.util
 from pathlib import Path
+import time
+
+import boto3
+from botocore.exceptions import ClientError
 
 from remediation.modules.cis_2_eks_control_plane import remediate_eks_core
 from remediation.modules.cis_3_eks_worker_nodes import main as remediate_worker_nodes_main
@@ -30,6 +34,29 @@ def env_or_prompt(key, default=None, required=False):
     if required and not val:
         raise SystemExit(f"Thiếu {key}, không thể chạy.")
     return val
+
+
+def wait_for_cluster_idle(cluster_name, region, timeout_seconds=1800, poll_seconds=15):
+    """Chờ đến khi EKS cluster không còn update đang chạy."""
+    eks_client = boto3.client("eks", region_name=region)
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            updates = eks_client.list_updates(name=cluster_name).get("updateIds", [])
+            in_progress = []
+            for update_id in updates:
+                info = eks_client.describe_update(name=cluster_name, updateId=update_id)
+                status = info.get("update", {}).get("status")
+                if status in {"InProgress", "Pending"}:
+                    in_progress.append(update_id)
+            if not in_progress:
+                return
+            print(f"⏳ Cluster đang có update chạy ({len(in_progress)}). Đợi {poll_seconds}s...")
+            time.sleep(poll_seconds)
+        except ClientError as exc:
+            print(f"⚠️  Không thể kiểm tra update EKS: {exc}")
+            time.sleep(poll_seconds)
+    raise SystemExit("⛔ Hết thời gian chờ cluster idle. Hãy thử lại sau.")
 
 
 def run_worker_nodes_remediation(instance_id, region):
@@ -69,6 +96,7 @@ def main():
     remediate_section_1(cluster_name, repo_name, node_role)
 
     print("\n=== [REMEDIATION 2] Control Plane & Managed Services ===")
+    wait_for_cluster_idle(cluster_name, region)
     remediate_eks_core(cluster_name, region)
 
     print("\n=== [REMEDIATION 3] Worker Nodes (SSM) ===")
