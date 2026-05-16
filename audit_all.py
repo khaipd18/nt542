@@ -2,6 +2,8 @@
 import os
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
 
 from audit.modules.cis_1_eks_infra_iam import audit_section_1_infrastructure
 from audit.modules.cis_2_eks_control_plane import audit_cis_eks_benchmark
@@ -23,6 +25,17 @@ def env_or_prompt(key, default=None, required=False):
     if required and not val:
         raise SystemExit(f"Thiếu {key}, không thể chạy.")
     return val
+
+
+def run_simulation(instance_id, region):
+    script_path = Path(__file__).resolve().parent / "simulation" / "cis_3_eks_worker_nodes.py"
+    if not script_path.exists():
+        raise SystemExit(f"Không tìm thấy file simulation: {script_path}")
+    cmd = [sys.executable, str(script_path), "--instance-id", instance_id, "--region", region]
+    print("\n=== [SIMULATION] Worker Nodes (CIS 3.x) ===")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise SystemExit(f"Simulation thất bại với mã lỗi {result.returncode}.")
 
 
 def run_worker_nodes_audit(instance_id, region):
@@ -61,6 +74,9 @@ def main():
 
     print("\n=== [AUDIT 2] Control Plane & Managed Services ===")
     audit_cis_eks_benchmark(cluster_name, region)
+
+    # Thêm bước simulation trước khi audit phần 3 theo README
+    run_simulation(instance_id, region)
 
     print("\n=== [AUDIT 3] Worker Nodes (SSM) ===")
     run_worker_nodes_audit(instance_id, region)
