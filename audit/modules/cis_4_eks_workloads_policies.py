@@ -16,7 +16,6 @@ class Finding:
     status: str
     scope: str
     evidence: str
-    remediation: str
 
 def run(cmd):
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -25,7 +24,7 @@ def run(cmd):
 def kubectl_json(args):
     code, out, err = run(["kubectl"] + args)
     if code != 0:
-        raise RuntimeError(f"kubectl {' '.join(args)} failed: {err or out}")
+        raise RuntimeError(f"lệnh kubectl {' '.join(args)} thất bại: {err or out}")
     if not out:
         return {}
     return json.loads(out)
@@ -33,7 +32,7 @@ def kubectl_json(args):
 def get_namespaced_resources():
     code, out, err = run(["kubectl", "api-resources", "--verbs=list", "--namespaced", "-o", "name"])
     if code != 0:
-        raise RuntimeError(f"kubectl api-resources failed: {err or out}")
+        raise RuntimeError(f"lệnh kubectl api-resources thất bại: {err or out}")
     resources = [line.strip() for line in out.splitlines() if line.strip()]
     skip = {
         "bindings", "componentstatuses", "events", "localsubjectaccessreviews",
@@ -62,7 +61,7 @@ def audit_cis_4_1_3():
         try:
             data = kubectl_json(args_prefix + ["-o", "json"])
         except Exception as e:
-            findings.append(Finding("4.1.3", "Minimize wildcard use in Roles and ClusterRoles", "Manual", "FAIL", "Cluster RBAC", f"Could not read {kind}: {e}", "Check cluster access."))
+            findings.append(Finding("4.1.3", "Hạn chế sử dụng wildcard trong Roles và ClusterRoles", "Thủ công", "FAIL", "Cluster RBAC", f"Không thể đọc {kind}: {e}"))
             return
 
         for item in data.get("items", []):
@@ -79,12 +78,11 @@ def audit_cis_4_1_3():
                     scope_ns = f"{namespace}/" if namespace else ""
                     findings.append(Finding(
                         cis_id="4.1.3",
-                        title="Minimize wildcard use in Roles and ClusterRoles",
-                        bench_type="Manual",
+                        title="Hạn chế sử dụng wildcard trong Roles và ClusterRoles",
+                        bench_type="Thủ công",
                         status="FAIL",
                         scope=f"{kind}/{scope_ns}{name}",
-                        evidence=f"apiGroups={api_groups}, resources={resources}, verbs={verbs}",
-                        remediation="Replace wildcards in Roles/ClusterRoles with specific resources and verbs."
+                        evidence=f"apiGroups={api_groups}, resources={resources}, verbs={verbs}"
                     ))
                     fail_count += 1
 
@@ -92,7 +90,7 @@ def audit_cis_4_1_3():
     scan_role_list("ClusterRole", ["get", "clusterroles"])
 
     if fail_count == 0:
-        findings.append(Finding("4.1.3", "Minimize wildcard use in Roles and ClusterRoles", "Manual", "PASS", "Cluster RBAC", "No wildcard rules found.", "No action required."))
+        findings.append(Finding("4.1.3", "Hạn chế sử dụng wildcard trong Roles và ClusterRoles", "Thủ công", "PASS", "Cluster RBAC", "Không tìm thấy quy tắc wildcard nào."))
     return findings
 
 def audit_cis_4_2_1():
@@ -100,7 +98,7 @@ def audit_cis_4_2_1():
     try:
         data = kubectl_json(["get", "pods", "--all-namespaces", "-o", "json"])
     except Exception as e:
-        return [Finding("4.2.1", "Minimize the admission of privileged containers", "Manual", "FAIL", "Cluster Pods", f"Error: {e}", "")]
+        return [Finding("4.2.1", "Hạn chế cấp phép cho privileged containers", "Thủ công", "FAIL", "Cluster Pods", f"Lỗi: {e}")]
 
     fail_count = 0
     for pod in data.get("items", []):
@@ -126,17 +124,16 @@ def audit_cis_4_2_1():
         if privileged_containers:
             findings.append(Finding(
                 cis_id="4.2.1",
-                title="Minimize the admission of privileged containers",
-                bench_type="Manual",
+                title="Hạn chế cấp phép cho privileged containers",
+                bench_type="Thủ công",
                 status="FAIL",
                 scope=f"Pod/{namespace}/{pod_name}",
-                evidence=f"privileged containers={privileged_containers}",
-                remediation="Apply Pod Security Admission labels to restrict privileged containers."
+                evidence=f"privileged containers={privileged_containers}"
             ))
             fail_count += 1
             
     if fail_count == 0:
-        findings.append(Finding("4.2.1", "Minimize the admission of privileged containers", "Manual", "PASS", "Cluster Pods", "No privileged containers found.", "No action required."))
+        findings.append(Finding("4.2.1", "Hạn chế cấp phép cho privileged containers", "Thủ công", "PASS", "Cluster Pods", "Không tìm thấy privileged container nào."))
     return findings
 
 def audit_cis_4_2_4():
@@ -144,7 +141,7 @@ def audit_cis_4_2_4():
     try:
         data = kubectl_json(["get", "pods", "--all-namespaces", "-o", "json"])
     except Exception as e:
-        return [Finding("4.2.4", "Minimize hostNetwork admission", "Manual", "FAIL", "Cluster Pods", f"Error: {e}", "")]
+        return [Finding("4.2.4", "Hạn chế cấp phép hostNetwork", "Thủ công", "FAIL", "Cluster Pods", f"Lỗi: {e}")]
 
     fail_count = 0
     for pod in data.get("items", []):
@@ -159,17 +156,16 @@ def audit_cis_4_2_4():
         if spec.get("hostNetwork") is True:
             findings.append(Finding(
                 cis_id="4.2.4",
-                title="Minimize hostNetwork admission",
-                bench_type="Manual",
+                title="Hạn chế cấp phép hostNetwork",
+                bench_type="Thủ công",
                 status="FAIL",
                 scope=f"Pod/{namespace}/{pod_name}",
-                evidence="spec.hostNetwork=true",
-                remediation="Add namespace policies to restrict hostNetwork containers."
+                evidence="spec.hostNetwork=true"
             ))
             fail_count += 1
             
     if fail_count == 0:
-        findings.append(Finding("4.2.4", "Minimize hostNetwork admission", "Manual", "PASS", "Cluster Pods", "No hostNetwork containers found.", "No action required."))
+        findings.append(Finding("4.2.4", "Hạn chế cấp phép hostNetwork", "Thủ công", "PASS", "Cluster Pods", "Không tìm thấy container nào sử dụng hostNetwork."))
     return findings
 
 def audit_cis_4_3_2():
@@ -178,7 +174,7 @@ def audit_cis_4_3_2():
         namespaces = kubectl_json(["get", "namespaces", "-o", "json"]).get("items", [])
         np_data = kubectl_json(["get", "networkpolicies", "--all-namespaces", "-o", "json"])
     except Exception as e:
-        return [Finding("4.3.2", "All namespaces have Network Policies defined", "Manual", "FAIL", "Cluster Namespaces", f"Error: {e}", "")]
+        return [Finding("4.3.2", "Tất cả các namespace phải định nghĩa Network Policies", "Thủ công", "FAIL", "Cluster Namespaces", f"Lỗi: {e}")]
 
     ns_with_np = set()
     for item in np_data.get("items", []):
@@ -192,17 +188,16 @@ def audit_cis_4_3_2():
         if ns_name not in ns_with_np:
             findings.append(Finding(
                 cis_id="4.3.2",
-                title="All namespaces have Network Policies defined",
-                bench_type="Manual",
+                title="Tất cả các namespace phải định nghĩa Network Policies",
+                bench_type="Thủ công",
                 status="FAIL",
                 scope=f"Namespace/{ns_name}",
-                evidence="No NetworkPolicy objects in namespace",
-                remediation="Create at least one NetworkPolicy in each user namespace (for example, a default-deny policy)."
+                evidence="Không có đối tượng NetworkPolicy nào trong namespace"
             ))
             fail_count += 1
             
     if fail_count == 0:
-        findings.append(Finding("4.3.2", "All namespaces have Network Policies defined", "Manual", "PASS", "Cluster Namespaces", "All user namespaces have Network Policies.", "No action required."))
+        findings.append(Finding("4.3.2", "Tất cả các namespace phải định nghĩa Network Policies", "Thủ công", "PASS", "Cluster Namespaces", "Tất cả user namespace đều đã có Network Policies."))
     return findings
 
 def audit_cis_4_5_2():
@@ -210,7 +205,7 @@ def audit_cis_4_5_2():
     try:
         resources = get_namespaced_resources()
     except Exception as e:
-        return [Finding("4.5.2", "The default namespace should not be used", "Automated", "FAIL", "Namespace/default", f"Error: {e}", "")]
+        return [Finding("4.5.2", "Không nên sử dụng default namespace", "Tự động", "FAIL", "Namespace/default", f"Lỗi: {e}")]
 
     found_objects = []
     for resource in resources:
@@ -250,21 +245,20 @@ def audit_cis_4_5_2():
     if found_objects:
         findings.append(Finding(
             cis_id="4.5.2",
-            title="The default namespace should not be used",
-            bench_type="Automated",
+            title="Không nên sử dụng default namespace",
+            bench_type="Tự động",
             status="FAIL",
             scope="Namespace/default",
-            evidence=f"objects found: {found_objects}",
-            remediation="Create namespaces for resources and ensure all new resources are created in a specific namespace."
+            evidence=f"tìm thấy các đối tượng: {found_objects}"
         ))
     else:
-        findings.append(Finding("4.5.2", "The default namespace should not be used", "Automated", "PASS", "Namespace/default", "No user workloads found in default namespace.", "No action required."))
+        findings.append(Finding("4.5.2", "Không nên sử dụng default namespace", "Tự động", "PASS", "Namespace/default", "Không tìm thấy user workload nào trong default namespace."))
         
     return findings
 
 def main():
-    parser = argparse.ArgumentParser(description="Audit CIS Amazon EKS Benchmark Section 4.")
-    parser.add_argument("--json", action="store_true", help="Print results as JSON")
+    parser = argparse.ArgumentParser(description="Kiểm tra CIS Amazon EKS Benchmark Phần 4.")
+    parser.add_argument("--json", action="store_true", help="In kết quả dưới dạng JSON")
     args = parser.parse_args()
 
     checks = [
@@ -289,13 +283,12 @@ def main():
     total_fail = sum(1 for f in all_findings if f.status == "FAIL")
     total_review = sum(1 for f in all_findings if f.status == "REVIEW")
 
-    print(f"\nSection 4 audit summary: PASS={total_pass} FAIL={total_fail} REVIEW={total_review}\n")
+    print(f"\nTổng kết đánh giá Phần 4: PASS={total_pass} FAIL={total_fail} REVIEW={total_review}\n")
 
     for f in all_findings:
         print(f"[{f.status}] CIS {f.cis_id} ({f.bench_type}) - {f.title}")
-        print(f"  Scope      : {f.scope}")
-        print(f"  Evidence   : {f.evidence}")
-        print(f"  Remediation: {f.remediation}\n")
+        print(f"  Phạm vi       : {f.scope}")
+        print(f"  Bằng chứng    : {f.evidence}\n")
 
     sys.exit(0 if total_fail == 0 else 1)
 
