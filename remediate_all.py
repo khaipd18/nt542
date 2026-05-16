@@ -3,6 +3,7 @@ import os
 import importlib.util
 from pathlib import Path
 import time
+import subprocess
 
 import boto3
 from botocore.exceptions import ClientError
@@ -59,6 +60,42 @@ def wait_for_cluster_idle(cluster_name, region, timeout_seconds=1800, poll_secon
     raise SystemExit("⛔ Hết thời gian chờ cluster idle. Hãy thử lại sau.")
 
 
+def ensure_kube_access(cluster_name, region):
+    """Đảm bảo kubeconfig sẵn sàng và endpoint có thể truy cập trước phần 4."""
+    eks_client = boto3.client("eks", region_name=region)
+    cluster = eks_client.describe_cluster(name=cluster_name)["cluster"]
+    vpc_cfg = cluster.get("resourcesVpcConfig", {})
+    is_private = vpc_cfg.get("endpointPrivateAccess", False)
+    is_public = vpc_cfg.get("endpointPublicAccess", False)
+
+    if is_private and not is_public:
+        print(
+            "⚠️  Cluster endpoint đang Private-only. Bạn phải chạy phần 4 từ máy có kết nối VPC "
+            "(VPN/DirectConnect/Bastion/EC2 trong VPC) mới truy cập được API server."
+        )
+
+    # Cố gắng cập nhật kubeconfig tự động (nếu có AWS CLI)
+    try:
+        subprocess.run(
+            ["aws", "eks", "update-kubeconfig", "--name", cluster_name, "--region", region],
+            check=True,
+        )
+    except FileNotFoundError:
+        print("⚠️  Không tìm thấy AWS CLI (aws). Bỏ qua bước update-kubeconfig tự động.")
+    except subprocess.CalledProcessError as exc:
+        print(f"⚠️  update-kubeconfig thất bại: {exc}")
+
+    # Kiểm tra kết nối bằng kubectl
+    try:
+        subprocess.run(["kubectl", "version", "--short"], check=True)
+    except FileNotFoundError:
+        raise SystemExit("⛔ Không tìm thấy kubectl. Hãy cài đặt kubectl rồi chạy lại.")
+    except subprocess.CalledProcessError:
+        raise SystemExit(
+            "⛔ Không thể kết nối Kubernetes API. Hãy kiểm tra kubeconfig hoặc mạng (nếu private endpoint)."
+        )
+
+
 def run_worker_nodes_remediation(instance_id, region):
     import sys
     argv_backup = sys.argv
@@ -104,6 +141,7 @@ def main():
     run_worker_nodes_remediation(instance_id, region)
 
     print("\n=== [REMEDIATION 4] Workloads & Policies ===")
+    ensure_kube_access(cluster_name, region)
     run_workloads_remediation(target_namespace)
 
 
