@@ -87,6 +87,17 @@ def set_public_endpoint(cluster_name, region):
     wait_for_cluster_idle(cluster_name, region)
 
 
+def _check_kubectl_available():
+    try:
+        subprocess.run(["kubectl", "version", "--short"], check=True, capture_output=True, text=True)
+        return
+    except subprocess.CalledProcessError as exc:
+        if "unknown flag: --short" not in (exc.stderr or ""):
+            raise
+    # Fallback for older kubectl versions
+    subprocess.run(["kubectl", "version"], check=True)
+
+
 def ensure_kube_access(cluster_name, region):
     """Đảm bảo kubeconfig sẵn sàng và endpoint có thể truy cập trước phần 4."""
     # Bật public endpoint tạm để chạy phần 4
@@ -105,7 +116,7 @@ def ensure_kube_access(cluster_name, region):
 
     # Kiểm tra kết nối bằng kubectl
     try:
-        subprocess.run(["kubectl", "version", "--short"], check=True)
+        _check_kubectl_available()
     except FileNotFoundError:
         raise SystemExit("⛔ Không tìm thấy kubectl. Hãy cài đặt kubectl rồi chạy lại.")
     except subprocess.CalledProcessError:
