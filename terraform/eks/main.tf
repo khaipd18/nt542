@@ -89,13 +89,6 @@ resource "aws_eks_cluster" "vuln_cluster" {
     public_access_cidrs     = ["0.0.0.0/0"]
   }
 
-  # Lỗi 4.1.7
-  access_config {
-    authentication_mode = "API_AND_CONFIG_MAP"
-    bootstrap_cluster_creator_admin_permissions = true
-  }
-
-  
 
   # ❌ LỖI 7: CIS 2.1.1 - Tắt toàn bộ Audit Logs và Control Plane Logs
   enabled_cluster_log_types = []
